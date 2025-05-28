@@ -1,8 +1,24 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import seaborn as sns
+from math import sqrt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from keras.models import Sequential, load_model
+from keras.layers import Dense, LSTM, Dropout, BatchNormalization
+from sklearn.metrics import mean_squared_error as mse
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.losses import MeanSquaredError
+from tensorflow.keras.metrics import RootMeanSquaredError
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 # ---------------------- Imports ---------------------- #
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from Ingestor import Ingestor
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import os
@@ -30,54 +46,6 @@ class AdamOptimizer:
         v_hat = self.v[key] / (1 - self.beta_2 ** self.t)
         param -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
         return param
-
-
-# ---------------------- Reproducibility ---------------------- #
-np.random.seed(40)  # 5,40
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-# ---------------------- Load and Preprocess Data ---------------------- #
-amnistadRelease = 'DataSetExport-Discharge Total.Last-24-Hour-Change-in-Storage@08450800-Instantaneous-TCM-20240622194957.csv'
-data = Ingestor(amnistadRelease).data
-
-df = pd.DataFrame(data)
-df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-df.set_index('Timestamp', inplace=True)
-df['Value'] = pd.to_numeric(df['Value'], errors='coerce').ffill()
-
-# Additional time-based features
-df['hour'] = df.index.hour
-df['dayofweek'] = df.index.dayofweek
-df['month'] = df.index.month
-df['day'] = df.index.day
-
-# Scaling features
-scaler_value = MinMaxScaler()
-scaler_time = MinMaxScaler()
-
-features = df[['Value', 'hour', 'dayofweek', 'month', 'day']].copy()
-scaled_values = scaler_value.fit_transform(features[['Value']])
-scaled_time = scaler_time.fit_transform(features.drop(columns='Value'))
-
-combined_scaled = np.hstack([scaled_values, scaled_time])
-
-
-# ---------------------- Sequence Generation ---------------------- #
-def create_sequences(data, seq_length):
-    sequences, targets = [], []
-    for i in range(seq_length, len(data)):
-        sequences.append(data[i - seq_length:i])
-        targets.append(data[i, 0])
-    return np.array(sequences), np.array(targets).reshape(-1, 1)
-
-
-seq_length = 10
-X, y = create_sequences(combined_scaled, seq_length)
-
-train_size = int(len(X) * 0.8)
-X_train, y_train = X[:train_size], y[:train_size]
-X_test, y_test = X[train_size:], y[train_size:]
-
 
 # ---------------------- NumPy LSTM Model with Full Backpropagation ---------------------- #
 class NumPyLSTMFullBP:
@@ -356,6 +324,7 @@ class NumPyLSTMFullBP:
             temperature *= anneal_rate  # Simulated annealing: decay temperature
 
 # ---------------------- Train and Evaluate ---------------------- #
+"""
 # Initialize the model with a dropout rate of 0.2 (20% dropout)
 model = NumPyLSTMFullBP(input_dim=5, hidden_dim=512, output_dim=1, learning_rate=0.001, loss_fn='rmse', clip_norm=1.0, dropout_rate=0.001)
 
@@ -371,16 +340,179 @@ y_test_inv = scaler_value.inverse_transform(y_test)
 
 mse = mean_squared_error(y_test_inv, predictions)
 mae = mean_absolute_error(y_test_inv, predictions)
-print(f'MSE: {mse:.4f}, MAE: {mae:.4f}')
+"""
+# ---------------------- LSTM Model with Keras ---------------------- #
 
-plt.figure(figsize=(14, 7))
-plt.plot(df.index[train_size + seq_length:], y_test_inv, label='Actual', color='black')
-plt.plot(df.index[train_size + seq_length:], predictions, label='Predicted', color='blue')
-plt.xlabel('Timestamp')
-plt.ylabel('Discharge Value')
-plt.title('LSTM Prediction vs Actual Values')
-plt.legend()
-plt.grid(True)
+df_train = pd.read_csv('LSTM-Multivariate_pollution.csv')
+df_train.info()
+
+split_index = int(len(df_train) * 0.8)
+df_train_final = df_train.iloc[:split_index]  # First 80% as new training set
+df_test = df_train.iloc[split_index:]         # Last 20% as test set
+
+# Checking null values
+print(df_train.isnull().sum() , "\n---------------- \n" , df_test.isnull().sum() )
+
+df_train.describe()
+
+df_train_scaled = df_train_final.copy()
+df_test_scaled = df_train_final.copy()
+
+# Define the mapping dictionary
+mapping = {'NE': 0, 'SE': 1, 'NW': 2, 'cv': 3}
+
+# Replace the string values with numerical values
+df_train_scaled['wnd_dir'] = df_train_scaled['wnd_dir'].map(mapping)
+df_test_scaled['wnd_dir'] = df_test_scaled['wnd_dir'].map(mapping)
+
+df_train_scaled['date'] = pd.to_datetime(df_train_scaled['date'])
+# Resetting the index
+df_train_scaled.set_index('date', inplace=True)
+df_train_scaled.head()
+
+values = df_train_scaled.values
+
+# specify columns to plot
+groups = [1, 2, 3]
+i = 1
+
+sns.set(style="darkgrid")
+
+fig, axs = plt.subplots(3,2, figsize=(34,24))
+
+sns.histplot(data=df_test_scaled, x="pollution", kde=True, color="skyblue", ax=axs[0, 0])
+sns.histplot(data=df_test_scaled, x="dew", kde=True, color="olive", ax=axs[0, 1])
+sns.histplot(data=df_test_scaled, x="temp", kde=True, color="gold", ax=axs[1, 0])
+sns.histplot(data=df_test_scaled, x="press", kde=True, color="teal", ax=axs[1, 1])
+sns.histplot(data=df_test_scaled, x="wnd_dir", kde=True, color="steelblue", ax=axs[2, 0])
+sns.histplot(data=df_test_scaled, x="wnd_spd", kde=True, color="goldenrod", ax=axs[2, 1])
+  # Adjust pad value as needed
 plt.show()
 
+scaler = MinMaxScaler()
 
+# Define the columns to scale
+columns = (['pollution', 'dew', 'temp', 'press', "wnd_dir", 'wnd_spd',
+       'snow', 'rain'])
+    
+df_test_scaled = df_test_scaled[columns]
+
+# Scale the selected columns to the range 0-1
+df_train_scaled[columns] = scaler.fit_transform(df_train_scaled[columns])
+df_test_scaled[columns] = scaler.transform(df_test_scaled[columns])
+
+# Show the scaled data
+df_train_scaled.head()
+
+df_test_scaled.head()
+
+df_train_scaled = np.array(df_train_scaled)
+df_test_scaled = np.array(df_test_scaled)
+
+X = []
+y = []
+n_future = 1
+n_past = 11
+
+#  Train Sets
+for i in range(n_past, len(df_train_scaled) - n_future+1):
+    X.append(df_train_scaled[i - n_past:i, 1:df_train_scaled.shape[1]])
+    y.append(df_train_scaled[i + n_future - 1:i + n_future, 0])
+X_train, y_train = np.array(X), np.array(y)
+
+#  Test Sets
+
+X = []
+y = []
+for i in range(n_past, len(df_test_scaled) - n_future+1):
+    X.append(df_test_scaled[i - n_past:i, 1:df_test_scaled.shape[1]])
+    y.append(df_test_scaled[i + n_future - 1:i + n_future, 0])
+X_test, y_test = np.array(X), np.array(y)
+
+print('X_train shape : {}   y_train shape : {} \n'
+      'X_test shape : {}      y_test shape : {} '.format(X_train.shape, y_train.shape, X_test.shape, y_test.shape))
+
+# design network
+
+model = Sequential()
+model.add(LSTM(32, input_shape=(X_train.shape[1], X_train.shape[2]), return_sequences=True))
+model.add(Dropout(0.2))
+model.add(LSTM(16, return_sequences=False))
+model.add(Dense(y_train.shape[1]))
+input_dim = X_train.shape[2]
+print(input_dim)
+model = NumPyLSTMFullBP(input_dim=input_dim, hidden_dim=32, output_dim=1, learning_rate=0.001, loss_fn='rmse', clip_norm=1.0, dropout_rate=0.001)
+
+# Train the model
+model.train(X_train, y_train, epochs=10, batch_size=32)
+predictions_custom = [model.forward(x, cache_enabled=False)[0] for x in X_test]
+predictions_custom = np.array(predictions_custom).reshape(-1, 1)
+best_model = load_model('best_model.keras')
+test_predictions = best_model.predict(X_test).flatten()
+test_results = pd.DataFrame(data={'Keras Predictions': test_predictions, 'Actual': y_test.flatten()})
+test_results['Custom NumPy Predictions'] = predictions_custom.flatten()
+
+plt.figure(figsize=(12, 6))
+plt.plot(test_results['Actual'][:200], label='True Values')
+plt.plot(test_results['Keras Predictions'][:200], label='Keras Predictions')
+plt.plot(test_results['Custom NumPy Predictions'][:200], label='Custom LSTM Predictions')
+plt.title("Pollution Predictions")
+plt.xlabel("Hours")
+plt.ylabel("Scaled Pollution")
+plt.legend()
+plt.show()
+
+# Custom NumPy LSTM evaluation
+mse_custom = mean_squared_error(y_test, predictions_custom)
+rmse_custom = sqrt(mse_custom)
+mae_custom = mean_absolute_error(y_test, predictions_custom)
+
+print('Custom NumPy LSTM Test MSE: %.5f' % mse_custom)
+print('Custom NumPy LSTM Test RMSE: %.5f' % rmse_custom)
+print('Custom NumPy LSTM Test MAE: %.5f' % mae_custom)
+
+# Keras LSTM evaluation
+mse_keras = mean_squared_error(y_test, test_predictions)
+rmse_keras = sqrt(mse_keras)
+mae_keras = mean_absolute_error(y_test, test_predictions)
+
+print('Keras LSTM Test MSE: %.5f' % mse_keras)
+print('Keras LSTM Test RMSE: %.5f' % rmse_keras)
+print('Keras LSTM Test MAE: %.5f' % mae_keras)
+"""
+# Compile the model
+model.compile(loss='mse', optimizer=Adam(learning_rate=0.001), metrics=[RootMeanSquaredError()])
+
+# Define callbacks for avoiding overfitting
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+checkpoint = ModelCheckpoint('best_model.keras', monitor='val_loss', save_best_only=True)
+
+model.summary()
+# fit network
+history = model.fit(X_train, y_train, epochs=150, batch_size=32, validation_split=0.1, callbacks=[early_stopping, checkpoint], shuffle=False)
+
+# Load the best model
+best_model = load_model('best_model.keras')
+
+plt.figure(figsize=(15,6))
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+
+test_predictions = best_model.predict(X_test).flatten()
+test_results = pd.DataFrame(data={'Train Predictions': test_predictions,
+                                  'Actual':y_test.flatten()})
+test_results.head()
+
+plt.plot(test_results['Train Predictions'][:200], label='Predicted Values')
+plt.plot(test_results['Actual'][:200], label='True Values')
+plt.legend()
+plt.show()
+
+rmse = sqrt(mse(y_test, test_predictions))
+print('Test RMSE: %.5f' % rmse)
+"""

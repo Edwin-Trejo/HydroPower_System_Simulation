@@ -96,9 +96,9 @@ X_test = X_test.reshape((X_test.shape[0],(seq_length * 2)  + 1, 1))
 # Define and train LSTM model
 lstm_model = Sequential([
     Input(shape=((seq_length * 2) + 1 , 1)), 
-    LSTM(64, return_sequences=True),
+    LSTM(128, return_sequences=True),
     Dropout(0.2),
-    LSTM(64),
+    LSTM(128),
     Dropout(0.2),
     Dense(1)
 ])

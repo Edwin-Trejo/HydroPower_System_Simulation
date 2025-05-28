@@ -1,12 +1,23 @@
-# ---------------------- Imports ---------------------- #
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import warnings
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pprint
+from matplotlib import style
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import LSTM
+from keras.layers import Dropout
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from Ingestor import Ingestor
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import os
-
 
 # ---------------------- Optimizer ---------------------- #
 class AdamOptimizer:
@@ -30,54 +41,6 @@ class AdamOptimizer:
         v_hat = self.v[key] / (1 - self.beta_2 ** self.t)
         param -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
         return param
-
-
-# ---------------------- Reproducibility ---------------------- #
-np.random.seed(40)  # 5,40
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-# ---------------------- Load and Preprocess Data ---------------------- #
-amnistadRelease = 'DataSetExport-Discharge Total.Last-24-Hour-Change-in-Storage@08450800-Instantaneous-TCM-20240622194957.csv'
-data = Ingestor(amnistadRelease).data
-
-df = pd.DataFrame(data)
-df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-df.set_index('Timestamp', inplace=True)
-df['Value'] = pd.to_numeric(df['Value'], errors='coerce').ffill()
-
-# Additional time-based features
-df['hour'] = df.index.hour
-df['dayofweek'] = df.index.dayofweek
-df['month'] = df.index.month
-df['day'] = df.index.day
-
-# Scaling features
-scaler_value = MinMaxScaler()
-scaler_time = MinMaxScaler()
-
-features = df[['Value', 'hour', 'dayofweek', 'month', 'day']].copy()
-scaled_values = scaler_value.fit_transform(features[['Value']])
-scaled_time = scaler_time.fit_transform(features.drop(columns='Value'))
-
-combined_scaled = np.hstack([scaled_values, scaled_time])
-
-
-# ---------------------- Sequence Generation ---------------------- #
-def create_sequences(data, seq_length):
-    sequences, targets = [], []
-    for i in range(seq_length, len(data)):
-        sequences.append(data[i - seq_length:i])
-        targets.append(data[i, 0])
-    return np.array(sequences), np.array(targets).reshape(-1, 1)
-
-
-seq_length = 10
-X, y = create_sequences(combined_scaled, seq_length)
-
-train_size = int(len(X) * 0.8)
-X_train, y_train = X[:train_size], y[:train_size]
-X_test, y_test = X[train_size:], y[train_size:]
-
 
 # ---------------------- NumPy LSTM Model with Full Backpropagation ---------------------- #
 class NumPyLSTMFullBP:
@@ -355,32 +318,127 @@ class NumPyLSTMFullBP:
             # Update temperature for simulated annealing.
             temperature *= anneal_rate  # Simulated annealing: decay temperature
 
-# ---------------------- Train and Evaluate ---------------------- #
-# Initialize the model with a dropout rate of 0.2 (20% dropout)
-model = NumPyLSTMFullBP(input_dim=5, hidden_dim=512, output_dim=1, learning_rate=0.001, loss_fn='rmse', clip_norm=1.0, dropout_rate=0.001)
 
-# Train the model
-model.train(X_train, y_train, epochs=100, batch_size=32)
+warnings.filterwarnings("ignore") # hide warnings
+
+# Load dataset
+df = pd.read_csv("AEP_hourly.csv")
+
+# Feature engineering
+df["Datetime"] = pd.to_datetime(df["Datetime"])
+df["Month"] = df["Datetime"].dt.month
+df["Year"] = df["Datetime"].dt.year
+df["Date"] = df["Datetime"].dt.date
+df["Time"] = df["Datetime"].dt.time
+df["Week"] = df["Datetime"].dt.isocalendar().week
+df["Day"] = df["Datetime"].dt.day_name()
+
+# Set datetime index and resample
+df = df.set_index("Datetime")
+df.index = pd.to_datetime(df.index)
+NewDataSet = df.resample('D').mean()
+
+print("Old Dataset ", df.shape)
+print("New  Dataset ", NewDataSet.shape)
+
+# Split data
+TestData = NewDataSet.tail(100)
+Training_Set = NewDataSet.iloc[:, 0:1][:-60]
+
+# Normalize data
+sc = MinMaxScaler(feature_range=(0, 1))
+Train = sc.fit_transform(Training_Set)
+
+# Create sequences
+X_Train, Y_Train = [], []
+for i in range(60, len(Train)):
+    X_Train.append(Train[i-60:i])
+    Y_Train.append(Train[i])
+X_Train, Y_Train = np.array(X_Train), np.array(Y_Train)
+X_Train = np.reshape(X_Train, (X_Train.shape[0], X_Train.shape[1], 1))
+
+# --- Keras LSTM Model ---
+regressor = Sequential()
+regressor.add(LSTM(units=32, input_shape=(X_Train.shape[1], 1)))
+regressor.add(Dropout(0.2))
+regressor.add(Dense(units=1))
+regressor.compile(optimizer='adam', loss='mean_squared_error')
+regressor.fit(X_Train, Y_Train, epochs=20, batch_size=32)
+
+# Prepare test data
+Df_Total = pd.concat((NewDataSet[['AEP_MW']], TestData[['AEP_MW']]), axis=0)
+inputs = Df_Total[len(Df_Total) - len(TestData) - 60:].values
+inputs = sc.transform(inputs.reshape(-1, 1))
+
+X_test = []
+for i in range(60, 160):
+    X_test.append(inputs[i-60:i])
+X_test = np.array(X_test)
+X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+
+# Predict with Keras
+predicted_price = regressor.predict(X_test)
+predicted_price = sc.inverse_transform(predicted_price)
+
+# --- Custom NumPy LSTM ---
+# Flatten data for custom model
+
+# Keep shape as (samples, timesteps, features)
+X_train_custom = X_Train.copy()
+y_train_custom = Y_Train.copy()
+
+X_test_custom = X_test.copy()  # Shape: (100, 60, 1)
+
+# Confirm input dimensions
+timesteps = X_train_custom.shape[1]
+input_dim = X_train_custom.shape[2]
+
+# Define and train your NumPy-based model
+model = NumPyLSTMFullBP(
+    input_dim=input_dim, hidden_dim=32, output_dim=1,
+    learning_rate=0.001, loss_fn='rmse', clip_norm=1.0, dropout_rate=0.001
+)
+model.train(X_train_custom, y_train_custom, epochs=10, batch_size=32)
+
+# Predict
+predictions_custom = [model.forward(x, cache_enabled=False)[0] for x in X_test_custom]
+predictions_custom = sc.inverse_transform(np.array(predictions_custom).reshape(-1, 1))
 
 
-# Prediction (disable caching)
-predictions = [model.forward(x, cache_enabled=False)[0] for x in X_test]
-predictions = np.array(predictions).reshape(-1, 1)
-predictions = scaler_value.inverse_transform(predictions)
-y_test_inv = scaler_value.inverse_transform(y_test)
+# --- Visualization ---
+True_MegaWatt = TestData["AEP_MW"].to_list()
+dates = TestData.index.to_list()
 
-mse = mean_squared_error(y_test_inv, predictions)
-mae = mean_absolute_error(y_test_inv, predictions)
-print(f'MSE: {mse:.4f}, MAE: {mae:.4f}')
+# --- Keras LSTM Metrics ---
+mse_keras = mean_squared_error(True_MegaWatt, predicted_price)
+mae_keras = mean_absolute_error(True_MegaWatt, predicted_price)
+rmse_keras = np.sqrt(mse_keras)
+
+print("Keras LSTM Performance:")
+print(f"MSE: {mse_keras:.4f}")
+print(f"MAE: {mae_keras:.4f}")
+print(f"RMSE: {rmse_keras:.4f}")
+
+# --- NumPy LSTM Metrics ---
+predictions_custom_arr = np.array(predictions_custom).reshape(-1)
+mse_numpy = mean_squared_error(True_MegaWatt, predictions_custom_arr)
+mae_numpy = mean_absolute_error(True_MegaWatt, predictions_custom_arr)
+rmse_numpy = np.sqrt(mse_numpy)
+
+print("\nNumPy LSTM Performance:")
+print(f"MSE: {mse_numpy:.4f}")
+print(f"MAE: {mae_numpy:.4f}")
+print(f"RMSE: {rmse_numpy:.4f}")
+
+
 
 plt.figure(figsize=(14, 7))
-plt.plot(df.index[train_size + seq_length:], y_test_inv, label='Actual', color='black')
-plt.plot(df.index[train_size + seq_length:], predictions, label='Predicted', color='blue')
-plt.xlabel('Timestamp')
-plt.ylabel('Discharge Value')
-plt.title('LSTM Prediction vs Actual Values')
+plt.plot(dates, True_MegaWatt, color="red", label="Original")
+plt.plot(dates, predicted_price, color="blue", label="Keras LSTM")
+plt.plot(dates, predictions_custom, color="green", label="Dynamic Outlier Filter LSTM")
+plt.xlabel('Dates')
+plt.ylabel("Power in MW")
+plt.title("Energy Consumption Predictions")
 plt.legend()
-plt.grid(True)
+plt.gcf().autofmt_xdate()
 plt.show()
-
-

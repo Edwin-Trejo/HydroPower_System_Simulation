@@ -1,8 +1,16 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from keras.models import Sequential
+from keras.layers import Dense, LSTM, Dropout
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler 
+import yfinance as yf
+from datetime import datetime
 # ---------------------- Imports ---------------------- #
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from Ingestor import Ingestor
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import os
@@ -30,54 +38,6 @@ class AdamOptimizer:
         v_hat = self.v[key] / (1 - self.beta_2 ** self.t)
         param -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
         return param
-
-
-# ---------------------- Reproducibility ---------------------- #
-np.random.seed(40)  # 5,40
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-# ---------------------- Load and Preprocess Data ---------------------- #
-amnistadRelease = 'DataSetExport-Discharge Total.Last-24-Hour-Change-in-Storage@08450800-Instantaneous-TCM-20240622194957.csv'
-data = Ingestor(amnistadRelease).data
-
-df = pd.DataFrame(data)
-df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
-df.set_index('Timestamp', inplace=True)
-df['Value'] = pd.to_numeric(df['Value'], errors='coerce').ffill()
-
-# Additional time-based features
-df['hour'] = df.index.hour
-df['dayofweek'] = df.index.dayofweek
-df['month'] = df.index.month
-df['day'] = df.index.day
-
-# Scaling features
-scaler_value = MinMaxScaler()
-scaler_time = MinMaxScaler()
-
-features = df[['Value', 'hour', 'dayofweek', 'month', 'day']].copy()
-scaled_values = scaler_value.fit_transform(features[['Value']])
-scaled_time = scaler_time.fit_transform(features.drop(columns='Value'))
-
-combined_scaled = np.hstack([scaled_values, scaled_time])
-
-
-# ---------------------- Sequence Generation ---------------------- #
-def create_sequences(data, seq_length):
-    sequences, targets = [], []
-    for i in range(seq_length, len(data)):
-        sequences.append(data[i - seq_length:i])
-        targets.append(data[i, 0])
-    return np.array(sequences), np.array(targets).reshape(-1, 1)
-
-
-seq_length = 10
-X, y = create_sequences(combined_scaled, seq_length)
-
-train_size = int(len(X) * 0.8)
-X_train, y_train = X[:train_size], y[:train_size]
-X_test, y_test = X[train_size:], y[train_size:]
-
 
 # ---------------------- NumPy LSTM Model with Full Backpropagation ---------------------- #
 class NumPyLSTMFullBP:
@@ -355,32 +315,174 @@ class NumPyLSTMFullBP:
             # Update temperature for simulated annealing.
             temperature *= anneal_rate  # Simulated annealing: decay temperature
 
-# ---------------------- Train and Evaluate ---------------------- #
-# Initialize the model with a dropout rate of 0.2 (20% dropout)
-model = NumPyLSTMFullBP(input_dim=5, hidden_dim=512, output_dim=1, learning_rate=0.001, loss_fn='rmse', clip_norm=1.0, dropout_rate=0.001)
 
-# Train the model
-model.train(X_train, y_train, epochs=100, batch_size=32)
+# Style settings
+plt.style.use("fivethirtyeight")
 
+# Stock ticker for AAPL
+ticker = 'AAPL'
 
-# Prediction (disable caching)
-predictions = [model.forward(x, cache_enabled=False)[0] for x in X_test]
-predictions = np.array(predictions).reshape(-1, 1)
-predictions = scaler_value.inverse_transform(predictions)
-y_test_inv = scaler_value.inverse_transform(y_test)
+# Date range
+end = datetime.now()
+start = datetime(end.year - 1, end.month, end.day)
 
-mse = mean_squared_error(y_test_inv, predictions)
-mae = mean_absolute_error(y_test_inv, predictions)
-print(f'MSE: {mse:.4f}, MAE: {mae:.4f}')
+# Download AAPL data
+df = yf.download(ticker, start=start, end=end)
 
-plt.figure(figsize=(14, 7))
-plt.plot(df.index[train_size + seq_length:], y_test_inv, label='Actual', color='black')
-plt.plot(df.index[train_size + seq_length:], predictions, label='Predicted', color='blue')
-plt.xlabel('Timestamp')
-plt.ylabel('Discharge Value')
-plt.title('LSTM Prediction vs Actual Values')
-plt.legend()
-plt.grid(True)
+print(len(df), "rows of data loaded")
+
+# Check if data is empty
+if df.empty:
+    print("No data loaded. Exiting.")
+    exit()
+
+# Handle missing data by forward filling
+df.fillna(method='ffill', inplace=True)
+
+# Check if there are still any missing values after forward filling
+if df.isna().sum().sum() > 0:
+    print(f"Warning: There are still missing values after forward filling! Total missing values: {df.isna().sum().sum()}")
+else:
+    print("No missing values in the data after forward filling.")
+
+# Plot closing prices
+plt.figure(figsize=(16, 6))
+plt.title(f'{ticker} Close Price History')
+plt.plot(df['Close'])
+plt.xlabel('Date')
+plt.ylabel('Close Price USD ($)')
 plt.show()
 
+# Create a new dataframe with only the 'Close' column
+df['Close'] = df['Close'].fillna(method='ffill')
+data = df['Close']
+dataset = data.values
 
+# Get the number of rows to train the model on (95% for training, 5% for testing)
+training_data_len = int(np.ceil(len(dataset) * 0.95))
+
+# Scale the data
+scaler = StandardScaler()
+scaled_data = scaler.fit_transform(dataset.reshape(-1, 1))
+
+# Create the scaled training data set
+train_data = scaled_data[0:int(training_data_len), :]
+
+# Split the data into x_train and y_train data sets
+X_train, y_train = [], []
+for i in range(60, len(train_data)):
+    X_train.append(train_data[i-60:i, 0])
+    y_train.append(train_data[i, 0])
+
+# Convert the X_train and y_train to numpy arrays
+X_train, y_train = np.array(X_train), np.array(y_train)
+
+X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+
+# Build the LSTM model
+Keras_model = Sequential()
+Keras_model.add(LSTM(256, return_sequences=True, input_shape=(X_train.shape[1], 1)))
+Keras_model.add(Dropout(0.2))  # Add Dropout layer
+Keras_model.add(LSTM(256, return_sequences=False))
+Keras_model.add(Dropout(0.2))  # Add Dropout layer
+Keras_model.add(Dense(25))
+Keras_model.add(Dense(1))
+
+Keras_model.compile(optimizer='adam', loss='mean_squared_error')
+
+# Train the model
+Keras_model.fit(X_train, y_train, batch_size=32, epochs=100)
+
+# Create the testing data set
+test_data = scaled_data[training_data_len - 60:, :]
+
+# Create the x_test and y_test data sets
+x_test, y_test = [], dataset[training_data_len:]
+for i in range(60, len(test_data)):
+    x_test.append(test_data[i-60:i, 0])
+
+# Convert the data to a numpy array
+x_test = np.array(x_test)
+
+# Reshape the data for LSTM
+x_test = np.reshape(x_test, (x_test.shape[0], x_test.shape[1], 1))
+
+# Get the model's predicted price values
+predictions = Keras_model.predict(x_test)
+predictions = scaler.inverse_transform(predictions)
+
+# Get the root mean squared error (RMSE)
+rmse = np.sqrt(np.mean((predictions - y_test) ** 2))
+print(f"Test RMSE: {rmse:.5f}")
+
+# Mean Squared Error (MSE)
+mse = np.mean((predictions - y_test) ** 2)
+print(f"Test MSE: {mse:.5f}")
+
+# Mean Absolute Error (MAE)
+mae = np.mean(np.abs(predictions - y_test))
+print(f"Test MAE: {mae:.5f}")
+
+# Create the train and valid DataFrames with 'Close' column
+train = df[:training_data_len].copy()  # Ensure it is a DataFrame
+valid = df[training_data_len:].copy()  # Ensure it is a DataFrame
+#test_results = pd.DataFrame(data={'Keras Predictions': predictions, 'Actual': y_test.flatten()})
+# Add predictions to the valid DataFrame using .loc to avoid the warning  # Use .loc to assign values
+
+# Build and initialize the custom NumPy LSTM model
+model = NumPyLSTMFullBP(input_dim=X_train.shape[2], hidden_dim=512, output_dim=1, 
+                         learning_rate=0.001, loss_fn='rmse', clip_norm=1.0, dropout_rate=0.001)
+
+# Train the custom model
+model.train(X_train, y_train, epochs=10, batch_size=32)
+
+# Prepare test data in the same way
+test_data = scaled_data[training_data_len - 60:, :]
+X_test, y_test = [], dataset[training_data_len:]
+
+for i in range(60, len(test_data)):
+    X_test.append(test_data[i-60:i, 0])
+
+X_test = np.array(X_test)
+
+# Make predictions using the custom model
+predictions_custom = [model.forward(x.reshape(x.shape[0], -1), cache_enabled=False)[0] for x in X_test]
+predictions_custom = np.array(predictions_custom).reshape(-1, 1)
+
+# Inverse scale the predictions
+predictions_custom = scaler.inverse_transform(predictions_custom)
+
+# Create a DataFrame for comparison
+#test_results['Custom NumPy Predictions'] = predictions_custom.flatten()
+
+# Print RMSE for the custom model
+rmse_custom = np.sqrt(np.mean((predictions_custom.flatten() - y_test.flatten()) ** 2))
+print(f"Custom Model RMSE: {rmse_custom:.5f}")
+
+# MSE for the custom model
+mse_custom = np.mean((predictions_custom.flatten() - y_test.flatten()) ** 2)
+print(f"Custom Model MSE: {mse_custom:.5f}")
+
+# MAE for the custom model
+mae_custom = np.mean(np.abs(predictions_custom.flatten() - y_test.flatten()))
+print(f"Custom Model MAE: {mae_custom:.5f}")
+
+# Plot the results
+train = df[:training_data_len].copy()  # Ensure it is a DataFrame
+valid = df[training_data_len:].copy()  # Ensure it is a DataFrame
+
+# Add predictions to the valid DataFrame using .loc to avoid the warning
+valid.loc[:, 'Dynamic Outlier Filter LSTM Predictions'] = predictions_custom.flatten()
+valid.loc[:, 'Keras Predictions'] = predictions
+# --- Calculate RMSE for Custom NumPy LSTM Model --- #
+
+
+# Visualize the results
+plt.figure(figsize=(16, 6))
+plt.title(f'LSTM Stock Price Prediction ({ticker})')
+plt.xlabel('Date', fontsize=18)
+plt.ylabel('Close Price USD ($)', fontsize=18)
+plt.plot(train['Close'])  # Now 'train' has 'Close'
+plt.plot(valid[['Close', 'Dynamic Outlier Filter LSTM Predictions', 'Keras Predictions']])  # Now 'valid' has 'Close' and 'Predictions'
+plt.legend(['Train Data', 'Truth Value', 'Dynamic Outlier Filter LSTM Predictions', 'Keras Predictions'], loc='lower right')
+plt.show()
